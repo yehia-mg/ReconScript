@@ -1,0 +1,16 @@
+# Scan results (sensitive/large data, should never be pushed to GitHub)
+collected_subdomains/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
