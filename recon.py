@@ -30,6 +30,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -71,6 +73,9 @@ API_PATTERN = re.compile(
 
 REQUIRED_TOOLS = ["subfinder", "assetfinder", "amass", "dnsx", "httpx", "katana", "waybackurls"]
 
+# How often (seconds) to print a "still running" heartbeat for long tool calls
+HEARTBEAT_INTERVAL = 15
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -92,28 +97,61 @@ def check_tools():
     return missing
 
 
+def format_elapsed(seconds: float) -> str:
+    """Format a duration in seconds as e.g. '2m 05s' or '43s'."""
+    seconds = int(seconds)
+    minutes, secs = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
 def run_cmd(cmd, timeout, input_text=None):
-    """Run a command and return its stdout as a list of non-empty lines. Fails soft."""
+    """
+    Run a command and return its stdout as a list of non-empty lines. Fails soft.
+
+    Runs the process in a background thread and prints a periodic "still
+    running" heartbeat (with elapsed time) to the console, since several of
+    these tools (amass, waybackurls, subfinder on large targets) can silently
+    take 10+ minutes with no output otherwise.
+    """
     tool_name = cmd[0]
-    try:
-        result = subprocess.run(
-            cmd,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0 and not result.stdout:
-            print(f"    [!] {tool_name} returned an error (code {result.returncode}): {result.stderr.strip()[:200]}")
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        return lines
-    except FileNotFoundError:
+    outcome = {}
+
+    def target():
+        try:
+            process = subprocess.run(
+                cmd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            outcome["result"] = process
+        except subprocess.TimeoutExpired as e:
+            outcome["timeout_error"] = e
+        except FileNotFoundError:
+            outcome["not_found"] = True
+        except Exception as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    start = time.time()
+    thread.start()
+
+    while thread.is_alive():
+        thread.join(timeout=HEARTBEAT_INTERVAL)
+        if thread.is_alive():
+            print(f"    ... {tool_name} still running ({format_elapsed(time.time() - start)} elapsed)")
+
+    elapsed_str = format_elapsed(time.time() - start)
+
+    if "not_found" in outcome:
         print(f"    [!] {tool_name} is not installed or not found on PATH — skipping")
         return []
-    except subprocess.TimeoutExpired as e:
-        # subprocess.run() populates e.stdout/e.stderr with whatever output the
-        # process had already produced before being killed — use it instead of
-        # throwing away partial results.
+
+    if "timeout_error" in outcome:
+        e = outcome["timeout_error"]
         partial_stdout = e.stdout or ""
         if isinstance(partial_stdout, bytes):
             partial_stdout = partial_stdout.decode(errors="ignore")
@@ -123,9 +161,17 @@ def run_cmd(cmd, timeout, input_text=None):
         else:
             print(f"    [!] {tool_name} exceeded {timeout}s and was stopped with no usable output")
         return lines
-    except Exception as e:
-        print(f"    [!] Unexpected error while running {tool_name}: {e}")
+
+    if "error" in outcome:
+        print(f"    [!] Unexpected error while running {tool_name}: {outcome['error']}")
         return []
+
+    result = outcome["result"]
+    if result.returncode != 0 and not result.stdout:
+        print(f"    [!] {tool_name} returned an error (code {result.returncode}): {result.stderr.strip()[:200]}")
+    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    print(f"    [done] {tool_name} finished in {elapsed_str}")
+    return lines
 
 
 def get_next_scan_number(output_dir: Path) -> int:
