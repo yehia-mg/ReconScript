@@ -24,6 +24,7 @@ IMPORTANT: Only run this against domains/assets you are authorized to test
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -171,24 +172,37 @@ def probe_http(subdomains: set):
         return result
 
     input_text = "\n".join(sorted(subdomains)) + "\n"
-    # -sc : show status code, format: url [status_code]
+    # -json : structured output, immune to ANSI color codes / format drift
+    #         between httpx versions (unlike parsing "-sc" plain text output)
     lines = run_cmd(
-        ["httpx", "-silent", "-sc", "-timeout", "10", "-retries", "1"],
+        ["httpx", "-silent", "-json", "-timeout", "10", "-retries", "1"],
         TIMEOUTS["httpx"],
         input_text=input_text,
     )
 
+    parse_failures = 0
     for line in lines:
-        m = re.match(r"(\S+)\s+\[(\d+)\]", line)
-        if not m:
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            parse_failures += 1
             continue
-        url, code = m.group(1), m.group(2)
+
+        url = data.get("url") or data.get("input")
+        code = data.get("status_code") or data.get("status-code") or data.get("statuscode")
+        if url is None or code is None:
+            continue
+
+        code = str(code)
         if code == "200":
             result["200"].append(url)
         elif code == "302":
             result["302"].append(url)
         else:
             result["other"].append(url)
+
+    if parse_failures:
+        print(f"    [!] {parse_failures} httpx line(s) could not be parsed as JSON and were skipped")
 
     print(f"    [=] 200: {len(result['200'])} | 302: {len(result['302'])} | other: {len(result['other'])}")
     return result
