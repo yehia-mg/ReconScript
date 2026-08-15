@@ -1,6 +1,0 @@
-نتائج السكانات (بيانات حساسة/كبيرة، ما ينفعش تترفع على GitHub)
-collected_subdomains/
-Python
-pycache/ *.pyc .venv/ venv/
-OS / Editor
-.DS_Store Thumbs.db .vscode/ .idea/
