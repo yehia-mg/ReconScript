@@ -171,8 +171,16 @@ python recon.py -d example.com -o my_results
 
 - The script is "fail-soft": if a tool isn't installed or times out, it's
   skipped and the pipeline continues with the rest instead of crashing.
-- amass can take longer than the other tools (it's auto-killed after 5
-  minutes by default; adjustable via `TIMEOUTS` inside `recon.py`).
+- No per-tool timeouts are enforced — tools run until they finish naturally,
+  since large scopes (hundreds of subdomains, big Wayback archives) can
+  legitimately take a long time. `amass` and `waybackurls` in particular can
+  run for a while on large targets; this is expected.
+- `dnsx`, `httpx`, and `katana` — the tools that send requests directly to
+  the target — are rate-limited by default (see `RATE_LIMITS` inside
+  `recon.py`) to stay respectful of the target and within typical bug-bounty
+  program limits. Passive-only tools (`subfinder`, `assetfinder`,
+  `amass -passive`, `waybackurls`) query third-party sources instead of the
+  target directly, so they aren't rate-limited.
 - The `collected_subdomains/` folder is listed in `.gitignore` so scan
   results are never accidentally pushed to GitHub.
 

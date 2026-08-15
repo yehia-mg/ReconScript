@@ -38,15 +38,29 @@ from pathlib import Path
 
 DEFAULT_OUTPUT_DIR = "collected_subdomains"
 
-# Timeouts (seconds) per tool call — prevents the script from hanging forever
+# No per-tool timeouts by default — large scopes (500+ hosts, big Wayback
+# archives) can legitimately take a long time, and killing a tool mid-run
+# just loses work. Tools are left to finish naturally. If you ever want a
+# hard cap again, set a value (in seconds) here instead of None.
 TIMEOUTS = {
-    "subfinder": 180,
-    "assetfinder": 120,
-    "amass": 300,
-    "dnsx": 120,
-    "httpx": 180,
-    "katana": 240,
-    "waybackurls": 120,
+    "subfinder": None,
+    "assetfinder": None,
+    "amass": None,
+    "dnsx": None,
+    "httpx": None,
+    "katana": None,
+    "waybackurls": None,
+}
+
+# Rate limits (requests/queries per second) for tools that hit the target
+# directly. This protects the target from being hammered and keeps the scan
+# within reasonable bug-bounty program limits. Passive-only tools that query
+# third-party sources (subfinder, assetfinder, amass -passive, waybackurls)
+# aren't rate-limited here since they don't touch the target's own servers.
+RATE_LIMITS = {
+    "dnsx": 100,     # DNS queries/sec against the target's resolvers
+    "httpx": 50,     # HTTP requests/sec against the target's servers
+    "katana": 20,    # HTTP requests/sec while crawling the target
 }
 
 # Regex used to flag API-looking endpoints/subdomains
@@ -96,9 +110,19 @@ def run_cmd(cmd, timeout, input_text=None):
     except FileNotFoundError:
         print(f"    [!] {tool_name} is not installed or not found on PATH — skipping")
         return []
-    except subprocess.TimeoutExpired:
-        print(f"    [!] {tool_name} took longer than {timeout}s and was stopped")
-        return []
+    except subprocess.TimeoutExpired as e:
+        # subprocess.run() populates e.stdout/e.stderr with whatever output the
+        # process had already produced before being killed — use it instead of
+        # throwing away partial results.
+        partial_stdout = e.stdout or ""
+        if isinstance(partial_stdout, bytes):
+            partial_stdout = partial_stdout.decode(errors="ignore")
+        lines = [l.strip() for l in partial_stdout.splitlines() if l.strip()]
+        if lines:
+            print(f"    [!] {tool_name} exceeded {timeout}s and was stopped — keeping {len(lines)} partial result(s)")
+        else:
+            print(f"    [!] {tool_name} exceeded {timeout}s and was stopped with no usable output")
+        return lines
     except Exception as e:
         print(f"    [!] Unexpected error while running {tool_name}: {e}")
         return []
@@ -155,7 +179,11 @@ def resolve_subdomains(subdomains: set) -> set:
     if not subdomains:
         return set()
     input_text = "\n".join(sorted(subdomains)) + "\n"
-    resolved = run_cmd(["dnsx", "-silent"], TIMEOUTS["dnsx"], input_text=input_text)
+    resolved = run_cmd(
+        ["dnsx", "-silent", "-rate-limit", str(RATE_LIMITS["dnsx"])],
+        TIMEOUTS["dnsx"],
+        input_text=input_text,
+    )
     resolved_set = set(resolved)
     print(f"    [=] Resolved: {len(resolved_set)} / {len(subdomains)}")
     return resolved_set if resolved_set else subdomains  # fail-open if dnsx unavailable
@@ -174,8 +202,12 @@ def probe_http(subdomains: set):
     input_text = "\n".join(sorted(subdomains)) + "\n"
     # -json : structured output, immune to ANSI color codes / format drift
     #         between httpx versions (unlike parsing "-sc" plain text output)
+    # -rate-limit : cap requests/sec against the target to stay respectful
+    #         and within typical bug-bounty program limits
+    # -retries 0 : skip retrying dead hosts; a single pass is enough here
     lines = run_cmd(
-        ["httpx", "-silent", "-json", "-timeout", "10", "-retries", "1"],
+        ["httpx", "-silent", "-json", "-timeout", "10", "-retries", "0",
+         "-rate-limit", str(RATE_LIMITS["httpx"])],
         TIMEOUTS["httpx"],
         input_text=input_text,
     )
@@ -220,7 +252,11 @@ def discover_endpoints(live_urls, domain: str) -> set:
         print("    -> katana")
         input_text = "\n".join(live_urls) + "\n"
         endpoints.update(
-            run_cmd(["katana", "-silent", "-jc", "-d", "2"], TIMEOUTS["katana"], input_text=input_text)
+            run_cmd(
+                ["katana", "-silent", "-jc", "-d", "2", "-rl", str(RATE_LIMITS["katana"])],
+                TIMEOUTS["katana"],
+                input_text=input_text,
+            )
         )
 
     print("    -> waybackurls")
