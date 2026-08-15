@@ -1,142 +1,281 @@
-#!/usr/bin/env python3 """ recon.py — Subdomain enumeration, DNS/HTTP filtering, and API-endpoint discovery.
+#!/usr/bin/env python3
+"""
+recon.py — Subdomain enumeration, DNS/HTTP filtering, and API-endpoint discovery.
+
 Pipeline:
-    1. Collect subdomains  -> subfinder + assetfinder + amass (passive)
-    2. DNS resolve/filter  -> dnsx
-    3. HTTP probe/classify -> httpx  (200 / 302 / other)
-    4. Endpoint discovery  -> katana + waybackurls
-    5. API-pattern filter  -> regex over discovered endpoints
-    6. Save results        -> collected_subdomains/scan_N*.txt (auto-incrementing)
-Cross-platform: works the same on Fedora/Linux and Windows, as long as the external tools (subfinder, assetfinder, amass, dnsx, httpx, katana, waybackurls) are installed and available on PATH.
-Usage: python recon.py -d example.com python recon.py -d example.com -o my_output_dir python recon.py -l domains.txt
-IMPORTANT: Only run this against domains/assets you are authorized to test (your own infrastructure, or an in-scope bug bounty program). """
-import argparse import os import re import shutil import subprocess import sys from pathlib import Path
---------------------------------------------------------------------------
-Configuration
---------------------------------------------------------------------------
+  1) Collect subdomains  -> subfinder + assetfinder + amass (passive)
+  2) DNS resolve/filter  -> dnsx
+  3) HTTP probe/classify -> httpx  (200 / 302 / other)
+  4) Endpoint discovery  -> katana + waybackurls
+  5) API-pattern filter  -> regex over discovered endpoints
+  6) Save results        -> collected_subdomains/scan_N*.txt (auto-incrementing)
+
+Cross-platform: works the same on Linux and Windows, as long as the
+external tools (subfinder, assetfinder, amass, dnsx, httpx, katana,
+waybackurls) are installed and available on PATH.
+
+Usage:
+    python recon.py -d example.com
+    python recon.py -d example.com -o my_output_dir
+    python recon.py -l domains.txt
+
+IMPORTANT: Only run this against domains/assets you are authorized to test
+(your own infrastructure, or an in-scope bug bounty program).
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
 DEFAULT_OUTPUT_DIR = "collected_subdomains"
-Timeouts (seconds) per tool call — prevents the script from hanging forever
-TIMEOUTS = { "subfinder": 180, "assetfinder": 120, "amass": 300, "dnsx": 120, "httpx": 180, "katana": 240, "waybackurls": 120, }
-Regex used to flag API-looking endpoints/subdomains
-API_PATTERN = re.compile( r"(api[0-9][.-]|[.-]api[0-9][.-]|graphql|/v[0-9]+/|/api/|swagger|openapi)", re.IGNORECASE, )
-REQUIRED_TOOLS = ["subfinder", "assetfinder", "amass", "dnsx", "httpx", "katana", "waybackurls"]
---------------------------------------------------------------------------
-Helpers
---------------------------------------------------------------------------
-def tool_exists(name: str) -> bool: """Check if a tool is available on PATH (cross-platform, handles .exe on Windows).""" return shutil.which(name) is not None
-def check_tools(): """Warn about any missing tools before starting. Doesn't hard-exit, just informs.""" missing = [t for t in REQUIRED_TOOLS if not tool_exists(t)] if missing: print("[!] الأدوات دي مش موجودة في الـ PATH وهيتم تخطي خطواتها:") for m in missing: print(f"    - {m}") print() return missing
-def run_cmd(cmd, timeout, input_text=None): """Run a command and return its stdout as a list of non-empty lines. Fails soft.""" tool_name = cmd[0] try: result = subprocess.run( cmd, input=input_text, capture_output=True, text=True, timeout=timeout, ) if result.returncode != 0 and not result.stdout: print(f"    [!] {tool_name} رجع بخطأ (كود {result.returncode}): {result.stderr.strip()[:200]}") lines = [l.strip() for l in result.stdout.splitlines() if l.strip()] return lines except FileNotFoundError: print(f"    [!] {tool_name} غير مثبت أو مش موجود في PATH — هيتم تخطيه") return [] except subprocess.TimeoutExpired: print(f"    [!] {tool_name} خد وقت أطول من {timeout}s وتم إيقافه") return [] except Exception as e: print(f"    [!] خطأ غير متوقع أثناء تشغيل {tool_name}: {e}") return []
-def get_next_scan_number(output_dir: Path) -> int: """Look at existing scan_N.txt files and return the next available number.""" output_dir.mkdir(parents=True, exist_ok=True) existing = list(output_dir.glob("scan_.txt")) numbers = [] for f in existing: m = re.match(r"scan_(\d+)(?:_.)?.txt$", f.name) if m: numbers.append(int(m.group(1))) return (max(numbers) + 1) if numbers else 1
-def save_list(path: Path, items): with open(path, "w", encoding="utf-8") as f: for item in sorted(set(items)): f.write(item + "\n") print(f"    [+] تم الحفظ: {path}  ({len(set(items))} سطر)")
---------------------------------------------------------------------------
-Step 1: Collection
---------------------------------------------------------------------------
-def collect_subdomains(domain: str) -> set: print("[1/5] جمع الـ subdomains (subfinder + assetfinder + amass)...") found = set()
-print("    -> subfinder")
-found.update(run_cmd(["subfinder", "-d", domain, "-silent"], TIMEOUTS["subfinder"]))
 
-print("    -> assetfinder")
-found.update(run_cmd(["assetfinder", "--subs-only", domain], TIMEOUTS["assetfinder"]))
+# Timeouts (seconds) per tool call — prevents the script from hanging forever
+TIMEOUTS = {
+    "subfinder": 180,
+    "assetfinder": 120,
+    "amass": 300,
+    "dnsx": 120,
+    "httpx": 180,
+    "katana": 240,
+    "waybackurls": 120,
+}
 
-print("    -> amass (passive)")
-found.update(run_cmd(["amass", "enum", "-passive", "-d", domain, "-silent"], TIMEOUTS["amass"]))
-
-# keep only lines that actually look like subdomains of the target
-found = {f for f in found if domain in f}
-print(f"    [=] إجمالي بعد الدمج والفلترة: {len(found)}")
-return found
---------------------------------------------------------------------------
-Step 2: DNS resolution filter
---------------------------------------------------------------------------
-def resolve_subdomains(subdomains: set) -> set: print("[2/5] فلترة DNS (dnsx)...") if not subdomains: return set() input_text = "\n".join(sorted(subdomains)) + "\n" resolved = run_cmd(["dnsx", "-silent"], TIMEOUTS["dnsx"], input_text=input_text) resolved_set = set(resolved) print(f"    [=] Resolved: {len(resolved_set)} / {len(subdomains)}") return resolved_set if resolved_set else subdomains  # fail-open if dnsx unavailable
---------------------------------------------------------------------------
-Step 3: HTTP probing / classification
---------------------------------------------------------------------------
-def probe_http(subdomains: set): print("[3/5] فحص الـ HTTP status codes (httpx)...") result = {"200": [], "302": [], "other": []} if not subdomains: return result
-input_text = "\n".join(sorted(subdomains)) + "\n"
-# -sc : show status code, format: url [status_code]
-lines = run_cmd(
-    ["httpx", "-silent", "-sc", "-timeout", "10", "-retries", "1"],
-    TIMEOUTS["httpx"],
-    input_text=input_text,
+# Regex used to flag API-looking endpoints/subdomains
+API_PATTERN = re.compile(
+    r"(api[0-9]*[.\-]|[.\-]api[0-9]*[.\-]|graphql|/v[0-9]+/|/api/|swagger|openapi)",
+    re.IGNORECASE,
 )
 
-for line in lines:
-    m = re.match(r"(\S+)\s+\[(\d+)\]", line)
-    if not m:
-        continue
-    url, code = m.group(1), m.group(2)
-    if code == "200":
-        result["200"].append(url)
-    elif code == "302":
-        result["302"].append(url)
-    else:
-        result["other"].append(url)
+REQUIRED_TOOLS = ["subfinder", "assetfinder", "amass", "dnsx", "httpx", "katana", "waybackurls"]
 
-print(f"    [=] 200: {len(result['200'])} | 302: {len(result['302'])} | other: {len(result['other'])}")
-return result
---------------------------------------------------------------------------
-Step 4: Endpoint discovery (katana + waybackurls) + API filtering
---------------------------------------------------------------------------
-def discover_endpoints(live_urls, domain: str) -> set: print("[4/5] اكتشاف endpoints إضافية (katana + waybackurls)...") endpoints = set()
-if live_urls:
-    print("    -> katana")
-    input_text = "\n".join(live_urls) + "\n"
-    endpoints.update(
-        run_cmd(["katana", "-silent", "-jc", "-d", "2"], TIMEOUTS["katana"], input_text=input_text)
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def tool_exists(name: str) -> bool:
+    """Check if a tool is available on PATH (cross-platform, handles .exe on Windows)."""
+    return shutil.which(name) is not None
+
+
+def check_tools():
+    """Warn about any missing tools before starting. Doesn't hard-exit, just informs."""
+    missing = [t for t in REQUIRED_TOOLS if not tool_exists(t)]
+    if missing:
+        print("[!] The following tools are missing from PATH and their steps will be skipped:")
+        for m in missing:
+            print(f"    - {m}")
+        print()
+    return missing
+
+
+def run_cmd(cmd, timeout, input_text=None):
+    """Run a command and return its stdout as a list of non-empty lines. Fails soft."""
+    tool_name = cmd[0]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0 and not result.stdout:
+            print(f"    [!] {tool_name} returned an error (code {result.returncode}): {result.stderr.strip()[:200]}")
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        return lines
+    except FileNotFoundError:
+        print(f"    [!] {tool_name} is not installed or not found on PATH — skipping")
+        return []
+    except subprocess.TimeoutExpired:
+        print(f"    [!] {tool_name} took longer than {timeout}s and was stopped")
+        return []
+    except Exception as e:
+        print(f"    [!] Unexpected error while running {tool_name}: {e}")
+        return []
+
+
+def get_next_scan_number(output_dir: Path) -> int:
+    """Look at existing scan_N.txt files and return the next available number."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(output_dir.glob("scan_*.txt"))
+    numbers = []
+    for f in existing:
+        m = re.match(r"scan_(\d+)(?:_.*)?\.txt$", f.name)
+        if m:
+            numbers.append(int(m.group(1)))
+    return (max(numbers) + 1) if numbers else 1
+
+
+def save_list(path: Path, items):
+    with open(path, "w", encoding="utf-8") as f:
+        for item in sorted(set(items)):
+            f.write(item + "\n")
+    print(f"    [+] Saved: {path}  ({len(set(items))} lines)")
+
+
+# --------------------------------------------------------------------------
+# Step 1: Collection
+# --------------------------------------------------------------------------
+
+def collect_subdomains(domain: str) -> set:
+    print("[1/5] Collecting subdomains (subfinder + assetfinder + amass)...")
+    found = set()
+
+    print("    -> subfinder")
+    found.update(run_cmd(["subfinder", "-d", domain, "-silent"], TIMEOUTS["subfinder"]))
+
+    print("    -> assetfinder")
+    found.update(run_cmd(["assetfinder", "--subs-only", domain], TIMEOUTS["assetfinder"]))
+
+    print("    -> amass (passive)")
+    found.update(run_cmd(["amass", "enum", "-passive", "-d", domain, "-silent"], TIMEOUTS["amass"]))
+
+    # keep only lines that actually look like subdomains of the target
+    found = {f for f in found if domain in f}
+    print(f"    [=] Total after merging and filtering: {len(found)}")
+    return found
+
+
+# --------------------------------------------------------------------------
+# Step 2: DNS resolution filter
+# --------------------------------------------------------------------------
+
+def resolve_subdomains(subdomains: set) -> set:
+    print("[2/5] DNS filtering (dnsx)...")
+    if not subdomains:
+        return set()
+    input_text = "\n".join(sorted(subdomains)) + "\n"
+    resolved = run_cmd(["dnsx", "-silent"], TIMEOUTS["dnsx"], input_text=input_text)
+    resolved_set = set(resolved)
+    print(f"    [=] Resolved: {len(resolved_set)} / {len(subdomains)}")
+    return resolved_set if resolved_set else subdomains  # fail-open if dnsx unavailable
+
+
+# --------------------------------------------------------------------------
+# Step 3: HTTP probing / classification
+# --------------------------------------------------------------------------
+
+def probe_http(subdomains: set):
+    print("[3/5] Probing HTTP status codes (httpx)...")
+    result = {"200": [], "302": [], "other": []}
+    if not subdomains:
+        return result
+
+    input_text = "\n".join(sorted(subdomains)) + "\n"
+    # -sc : show status code, format: url [status_code]
+    lines = run_cmd(
+        ["httpx", "-silent", "-sc", "-timeout", "10", "-retries", "1"],
+        TIMEOUTS["httpx"],
+        input_text=input_text,
     )
 
-print("    -> waybackurls")
-endpoints.update(run_cmd(["waybackurls", domain], TIMEOUTS["waybackurls"]))
+    for line in lines:
+        m = re.match(r"(\S+)\s+\[(\d+)\]", line)
+        if not m:
+            continue
+        url, code = m.group(1), m.group(2)
+        if code == "200":
+            result["200"].append(url)
+        elif code == "302":
+            result["302"].append(url)
+        else:
+            result["other"].append(url)
 
-print(f"    [=] إجمالي endpoints مكتشفة: {len(endpoints)}")
-return endpoints
-def filter_api_endpoints(endpoints: set) -> set: return {e for e in endpoints if API_PATTERN.search(e)}
---------------------------------------------------------------------------
-Main
---------------------------------------------------------------------------
-def main(): parser = argparse.ArgumentParser(description="Subdomain recon & API discovery pipeline") parser.add_argument("-d", "--domain", help="الدومين المستهدف (مثال: example.com)") parser.add_argument("-l", "--list", help="ملف فيه أكتر من دومين، سطر لكل دومين") parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="فولدر حفظ النتائج") args = parser.parse_args()
-if not args.domain and not args.list:
-    parser.error("لازم تحدد دومين بـ -d أو ملف دومينز بـ -l")
+    print(f"    [=] 200: {len(result['200'])} | 302: {len(result['302'])} | other: {len(result['other'])}")
+    return result
 
-domains = []
-if args.domain:
-    domains.append(args.domain.strip())
-if args.list:
-    with open(args.list, "r", encoding="utf-8") as f:
-        domains.extend([l.strip() for l in f if l.strip()])
 
-check_tools()
+# --------------------------------------------------------------------------
+# Step 4: Endpoint discovery (katana + waybackurls) + API filtering
+# --------------------------------------------------------------------------
 
-output_dir = Path(args.output)
-scan_num = get_next_scan_number(output_dir)
-print(f"=== Scan #{scan_num} — الدومينز: {', '.join(domains)} ===\n")
+def discover_endpoints(live_urls, domain: str) -> set:
+    print("[4/5] Discovering additional endpoints (katana + waybackurls)...")
+    endpoints = set()
 
-all_subdomains = set()
-all_endpoints = set()
-http_results = {"200": [], "302": [], "other": []}
+    if live_urls:
+        print("    -> katana")
+        input_text = "\n".join(live_urls) + "\n"
+        endpoints.update(
+            run_cmd(["katana", "-silent", "-jc", "-d", "2"], TIMEOUTS["katana"], input_text=input_text)
+        )
 
-for domain in domains:
-    subs = collect_subdomains(domain)
-    resolved = resolve_subdomains(subs)
-    classified = probe_http(resolved)
-    for k in http_results:
-        http_results[k].extend(classified[k])
+    print("    -> waybackurls")
+    endpoints.update(run_cmd(["waybackurls", domain], TIMEOUTS["waybackurls"]))
 
-    live = classified["200"] + classified["302"]
-    endpoints = discover_endpoints(live, domain)
-    all_endpoints.update(endpoints)
-    all_subdomains.update(resolved)
-    print()
+    print(f"    [=] Total endpoints discovered: {len(endpoints)}")
+    return endpoints
 
-print("[5/5] فلترة الـ API endpoints وحفظ النتائج...")
-api_endpoints = filter_api_endpoints(all_endpoints)
 
-# Save everything
-save_list(output_dir / f"scan_{scan_num}.txt", all_subdomains)
-save_list(output_dir / f"scan_{scan_num}_200.txt", http_results["200"])
-save_list(output_dir / f"scan_{scan_num}_302.txt", http_results["302"])
-save_list(output_dir / f"scan_{scan_num}_other.txt", http_results["other"])
-save_list(output_dir / f"scan_{scan_num}_api.txt", api_endpoints)
+def filter_api_endpoints(endpoints: set) -> set:
+    return {e for e in endpoints if API_PATTERN.search(e)}
 
-print(f"\n=== انتهى Scan #{scan_num}. النتائج في: {output_dir}/ ===")
-if name == "main": main()
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Subdomain recon & API discovery pipeline")
+    parser.add_argument("-d", "--domain", help="Target domain (e.g. example.com)")
+    parser.add_argument("-l", "--list", help="File containing multiple domains, one per line")
+    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory for results")
+    args = parser.parse_args()
+
+    if not args.domain and not args.list:
+        parser.error("You must specify a domain with -d or a domain list file with -l")
+
+    domains = []
+    if args.domain:
+        domains.append(args.domain.strip())
+    if args.list:
+        with open(args.list, "r", encoding="utf-8") as f:
+            domains.extend([l.strip() for l in f if l.strip()])
+
+    check_tools()
+
+    output_dir = Path(args.output)
+    scan_num = get_next_scan_number(output_dir)
+    print(f"=== Scan #{scan_num} — Domains: {', '.join(domains)} ===\n")
+
+    all_subdomains = set()
+    all_endpoints = set()
+    http_results = {"200": [], "302": [], "other": []}
+
+    for domain in domains:
+        subs = collect_subdomains(domain)
+        resolved = resolve_subdomains(subs)
+        classified = probe_http(resolved)
+        for k in http_results:
+            http_results[k].extend(classified[k])
+
+        live = classified["200"] + classified["302"]
+        endpoints = discover_endpoints(live, domain)
+        all_endpoints.update(endpoints)
+        all_subdomains.update(resolved)
+        print()
+
+    print("[5/5] Filtering API endpoints and saving results...")
+    api_endpoints = filter_api_endpoints(all_endpoints)
+
+    # Save everything
+    save_list(output_dir / f"scan_{scan_num}.txt", all_subdomains)
+    save_list(output_dir / f"scan_{scan_num}_200.txt", http_results["200"])
+    save_list(output_dir / f"scan_{scan_num}_302.txt", http_results["302"])
+    save_list(output_dir / f"scan_{scan_num}_other.txt", http_results["other"])
+    save_list(output_dir / f"scan_{scan_num}_api.txt", api_endpoints)
+
+    print(f"\n=== Scan #{scan_num} complete. Results saved in: {output_dir}/ ===")
+
+
+if __name__ == "__main__":
+    main()

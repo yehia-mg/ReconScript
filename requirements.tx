@@ -1,0 +1,12 @@
+# This project relies on external tools (Go binaries), not Python packages.
+# There are currently no external Python dependencies required — the script
+# only uses Python's standard library (argparse, subprocess, pathlib, re, shutil).
+#
+# Required external tools (installed separately, see README.md):
+#   - subfinder
+#   - assetfinder
+#   - amass
+#   - dnsx
+#   - httpx
+#   - katana
+#   - waybackurls
