@@ -197,8 +197,9 @@ def save_list(path: Path, items):
 # Step 1: Collection
 # --------------------------------------------------------------------------
 
-def collect_subdomains(domain: str) -> set:
-    print("[1/5] Collecting subdomains (subfinder + assetfinder + amass)...")
+def collect_subdomains(domain: str, skip_amass: bool = False) -> set:
+    label = "subfinder + assetfinder" if skip_amass else "subfinder + assetfinder + amass"
+    print(f"[1/5] Collecting subdomains ({label})...")
     found = set()
 
     print("    -> subfinder")
@@ -207,8 +208,11 @@ def collect_subdomains(domain: str) -> set:
     print("    -> assetfinder")
     found.update(run_cmd(["assetfinder", "--subs-only", domain], TIMEOUTS["assetfinder"]))
 
-    print("    -> amass (passive)")
-    found.update(run_cmd(["amass", "enum", "-passive", "-d", domain, "-silent"], TIMEOUTS["amass"]))
+    if skip_amass:
+        print("    -> amass skipped (--skip-amass)")
+    else:
+        print("    -> amass (passive)")
+        found.update(run_cmd(["amass", "enum", "-passive", "-d", domain, "-silent"], TIMEOUTS["amass"]))
 
     # keep only lines that actually look like subdomains of the target
     found = {f for f in found if domain in f}
@@ -325,6 +329,13 @@ def main():
     parser.add_argument("-d", "--domain", help="Target domain (e.g. example.com)")
     parser.add_argument("-l", "--list", help="File containing multiple domains, one per line")
     parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory for results")
+    parser.add_argument(
+        "--skip-amass",
+        action="store_true",
+        help="Skip amass during collection. amass is thorough but often the slowest "
+             "step by far (can take 10+ minutes on large targets); use this flag for "
+             "a much faster run when you don't need amass's extra coverage.",
+    )
     args = parser.parse_args()
 
     if not args.domain and not args.list:
@@ -341,14 +352,17 @@ def main():
 
     output_dir = Path(args.output)
     scan_num = get_next_scan_number(output_dir)
-    print(f"=== Scan #{scan_num} — Domains: {', '.join(domains)} ===\n")
+    print(f"=== Scan #{scan_num} — Domains: {', '.join(domains)} ===")
+    if args.skip_amass:
+        print("    (amass will be skipped for this run: --skip-amass)")
+    print()
 
     all_subdomains = set()
     all_endpoints = set()
     http_results = {"200": [], "302": [], "other": []}
 
     for domain in domains:
-        subs = collect_subdomains(domain)
+        subs = collect_subdomains(domain, skip_amass=args.skip_amass)
         resolved = resolve_subdomains(subs)
         classified = probe_http(resolved)
         for k in http_results:

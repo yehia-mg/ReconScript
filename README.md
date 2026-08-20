@@ -165,7 +165,15 @@ python recon.py -l domains.txt
 
 # Custom output folder
 python recon.py -d example.com -o my_results
+
+# Skip amass for a much faster run (amass is thorough but often the
+# slowest step by far, especially on large targets)
+python recon.py -d example.com --skip-amass
 ```
+
+`--skip-amass` is a per-run choice — nothing is hardcoded, so you can decide
+each time you run the script whether you want amass's extra coverage (slower,
+more thorough) or a quicker scan with just subfinder + assetfinder.
 
 ## Notes
 
